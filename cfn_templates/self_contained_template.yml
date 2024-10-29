@@ -72,6 +72,10 @@ Parameters:
     Type: String
     Description: ARN of the Lambda layer containing Pandas
     Default: arn:aws:lambda:us-west-2:336392948345:layer:AWSSDKPandas-Python38:26
+  CustomInstructions:
+    Type: String
+    Description: Instructions for customized analysis
+    Default: ''    
 Conditions:
   NotResourceTypesToBeCapturedByCWERule: !Equals
     - !Join
@@ -427,7 +431,7 @@ Resources:
 
                 email_body=f'''<html>  {today_config_emailbody} 
                 {daybefore_config_emailbody} 
-                {yesterday_cost_email_body} </html>'''
+                {yesterday_cost_email_body} {disclaimerStr}</html>'''
 
                 source_email = os.environ['SourceEmail']
                 destination_to_email = os.environ['DestinationEmail']
@@ -731,7 +735,7 @@ Resources:
                     - <Approved Estimates> have monthly cost so you have to Extrapolate actual cost incur <DailyCostAndUsageReport> for Analysis
                     - Run both <Primary Analysis Steps> and <Secondary Analysis Steps> before consolidating findings in <ResponseFormat>
                     - Think step by step in <Thinking> tag before generating final response, <Thinking> tag must have all details required for Human audit of finally generated report
-                    - Do not generate false Alarm- only add Findings in <Response> tag where you are confident
+                    - Do not generate false Alarm- only add Findings in <Response> tag where you are confident that Configuration Discrepancy or Cost Impact is significant 
                     - Do not Dictate human, be humble and use suggestive tone
                     </Instructions>
                     <Primary Analysis Steps>
@@ -749,11 +753,11 @@ Resources:
                     </Secondary Analysis Steps>
                     
                     <ResponseFormat>
-                    <Thinking>
-                    </Thinking>
+                      <Thinking>
+                      </Thinking>
                     </ResponseFormat>
                     Skip Preamble
-                    '''
+                    ''' +  os.environ['CustomInstructions']
 
             configuration_prompt = '''You are the Virtual Cost and Configuration Auditor who is specialist in validating each configuration change and its cost impact
                     IMPORTANT: you will compare each configuration change with every <Approved Estimates> and actual cost incur <DailyCostAndUsageReport> based on [Tag]
@@ -761,7 +765,7 @@ Resources:
                     - Take your time and think carefully go through <Primary Analysis> before answering
                     - <Approved Estimates> have monthly cost so you have to Extrapolate actual cost incur <DailyCostAndUsageReport> for Analysis
                     - Run <Final Analysis Steps> to generate final response
-                    - Do not generate false Alarm- only add Findings in <ResponseFormat> tag where you are confident
+                    - Do not generate false Alarm- only add Findings in <ResponseFormat> tag where you are confident that Configuration Discrepancy is significant
                     - Do not Dictate human, be humble and use suggestive tone
                     </Instructions>
 
@@ -812,7 +816,7 @@ Resources:
                         </HTML Format>
                     </ResponseFormat>
                     Skip Preamble
-                    '''
+                    ''' +  os.environ['CustomInstructions']
 
             cost_prompt = '''You are the Virtual Cost Auditor who is specialist in validating estimated cost and Actual cost Per Tag
                     IMPORTANT: you will compare each Tag with  <Approved Estimates> and actual cost incur <DailyCostAndUsageReport> based on [Tag]
@@ -820,7 +824,7 @@ Resources:
                     - Take your time and think carefully go through <Primary Analysis> before answering
                     - <Approved Estimates> have monthly cost so you have to Extrapolate actual cost incur <DailyCostAndUsageReport> for Analysis
                     - Run <Final Analysis Steps> to generate final response
-                    - Do not generate false Alarm- only add Findings in <ResponseFormat> tag where you are confident
+                    - Do not generate false Alarm- only add Findings in <ResponseFormat> tag where you are confident that Cost Impact is significant
                     - Do not Dictate human, be humble and use suggestive tone
                     </Instructions>
                     
@@ -866,7 +870,7 @@ Resources:
                         </HTML Format>
                     </ResponseFormat>
                     Skip Preamble
-                    '''
+                    ''' + os.environ['CustomInstructions']
 
       Runtime: python3.8
       Timeout: 300
@@ -881,6 +885,7 @@ Resources:
           SourceEmail: !Ref SourceEmail
           DestinationEmail: !Ref DestinationEmail
           AuditKeyPattern: !Ref AuditKeyPattern
+          CustomInstructions: !Ref CustomInstructions
 
   AuditFunctionExecutionRole:
     Type: AWS::IAM::Role
