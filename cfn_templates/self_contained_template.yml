@@ -1,0 +1,1067 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template creates EventBridge Rule, SQS Queues, Lambda
+  Functions, DynamoDB Table, and related resources.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Configuration Items Capture Scope
+        Parameters:
+          - ResourceTypesToBeCapturedByCWERule
+          - CIStatusToBeCapturedByCWERule
+      - Label:
+          default: AWS Lambda Configuration
+        Parameters:
+          - LambdaReservedConcurrentExecutions
+    ParameterLabels:
+      ResourceTypesToBeCapturedByCWERule:
+        default: Resource types to be captured by EventBridge event rule
+      CIStatusToBeCapturedByCWERule:
+        default: Configuration items status to be captured by EventBridge event rule
+      LambdaReservedConcurrentExecutions:
+        default: Lambda function reserved concurrent executions
+
+Parameters:
+  ResourceTypesToBeCapturedByCWERule:
+    Type: CommaDelimitedList
+    Description: The string list of resource types to be captured by the solution,
+      for example "AWS::S3::Bucket, AWS::EC2::Instance" (without quotation). If
+      no value is provided, default is the resources type(s) your
+      ConfigurationRecorder is currently capturing.
+    Default: <use default setting>
+  CIStatusToBeCapturedByCWERule:
+    Type: String
+    Description: The string list of configuration item status to be captured by the
+      solution. Default is to capture resource discovery, mutation, and
+      deletion.
+    Default: AllStatuses
+    AllowedValues:
+      - AllStatuses
+      - OnlyResourceDiscoveredAndResourceDeleted
+      - OnlyResourceDiscovered
+      - OnlyResourceDeleted
+  LambdaReservedConcurrentExecutions:
+    Type: String
+    Description: The number of simultaneous executions to reserve for the events
+      lookup Lambda function. Leave blank to use the default value.
+    Default: <use default setting>
+  EstimatesBucket:
+    Type: String
+    Description: bucket where all aws pricing estimates will be uploaded.
+  ModelId:
+    Type: String
+    Description: Bedrock Model Id.
+  Region:
+    Type: String
+    Description: Deployment Region.
+  CloudTrailRegion:
+    Type: String
+    Description: CloudTrail Region.
+  SourceEmail:
+    Type: String
+    Description: Email Address of Sender.
+  DestinationEmail:
+    Type: String
+    Description: Recipient Email address.
+  AuditKeyPattern:
+    Type: String
+    Description: Pattern to match audit key values in tags
+    Default: '''AuditKey'':''([^'']*)'''
+  LambdaLayerArn:
+    Type: String
+    Description: ARN of the Lambda layer containing Pandas
+    Default: arn:aws:lambda:us-west-2:336392948345:layer:AWSSDKPandas-Python38:26
+Conditions:
+  NotResourceTypesToBeCapturedByCWERule: !Equals
+    - !Join
+      - ''
+      - !Ref ResourceTypesToBeCapturedByCWERule
+    - <use default setting>
+  HasLambdaReservedConcurrentExecutions: !Not
+    - !Equals
+      - !Ref LambdaReservedConcurrentExecutions
+      - <use default setting>
+
+Mappings:
+  Settings:
+    CIStatus:
+      AllStatuses:
+        - ResourceDiscovered
+        - OK
+        - ResourceDeleted
+      OnlyResourceDiscoveredAndResourceDeleted:
+        - ResourceDiscovered
+        - ResourceDeleted
+      OnlyResourceDiscovered:
+        - ResourceDiscovered
+      OnlyResourceDeleted:
+        - ResourceDeleted
+
+Resources:
+  EstimatesS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref EstimatesBucket
+      VersioningConfiguration:
+        Status: Enabled
+
+  LookupCIEventsDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TableName: LookupCIEventsDynamoDBTable
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  LookupCIEventsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LookupCIEventsLambdaFunction
+      Environment:
+        Variables:
+          DynamoDBTableName: !Ref LookupCIEventsDynamoDBTable
+          EstimatesBucket: !Ref EstimatesBucket
+          Region: !Ref Region
+          CloudTrailRegion: !Ref CloudTrailRegion
+          AuditKeyPattern: !Ref AuditKeyPattern
+      Code:
+        ZipFile: |
+          import boto3
+          import sys
+          import time
+          import datetime as dt
+          import json
+          import os
+          import urllib.parse
+          import uuid
+          import pandas as pd
+          import io,re
+          region_name=os.environ['Region']
+          ct_region_name=os.environ['CloudTrailRegion']
+          s3_client = boto3.client(
+                      's3',
+                      region_name=region_name
+                  )
+          bucket_name=os.environ['EstimatesBucket']
+          all_tags=None
+          def lambda_handler(event, context):
+              try:
+                  global all_tags
+                  if all_tags is None:
+                      all_tags = process_all_files_for_tags()
+                  event = json.loads(event["Records"][0]["body"])["detail"]
+                  if event["messageType"] == "ConfigurationItemChangeNotification":
+                      CI = event["configurationItem"]
+                  elif event["messageType"] == "OversizedConfigurationItemChangeNotification":
+                      CI = event["configurationItemSummary"]
+                  else:
+                      print("Notification messageType is neither CI change nor oversized CI change.")
+                      sys.exit()
+                  resourceType = CI["resourceType"]
+                  ignored_resource_type = ["AWS::Config::ResourceCompliance","AWS::Config::ConformancePackCompliance"]
+                  if resourceType in ignored_resource_type:
+                      print(f"Resource Type {resourceType} included in discarded list - terminate")
+                      sys.exit()
+                  ItemCaptureTime = CI["configurationItemCaptureTime"]
+                  resourceARN = CI["ARN"]
+                  resourceId = CI["resourceId"]
+                  configurationItemStatus = CI["configurationItemStatus"]
+                  resourceName = CI.get("resourceName", CI["resourceId"])
+                  lookup_time = establish_time(ItemCaptureTime)
+                  start_lookup_time, end_lookup_time = lookup_time
+                  CT_lookup(resourceName, resourceId, resourceType, resourceARN, start_lookup_time, end_lookup_time, configurationItemStatus,CI)
+              except Exception as error:
+                  print(str(error))
+          def establish_time(ItemCaptureTime):
+              startime = (dt.datetime.strptime(ItemCaptureTime, '%Y-%m-%dT%H:%M:%S.%fZ') - dt.timedelta(seconds=900)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+              return startime, ItemCaptureTime
+          def CT_lookup(resourceName, resourceId, resourceType, resourceARN, start_lookup_time, end_lookup_time, configurationItemStatus,CI):
+              client = boto3.client('cloudtrail', region_name=ct_region_name if "AWS::IAM::" in resourceType else None)
+              for attribute_key, attribute_value in [("ResourceName", resourceName), ("ResourceName", resourceId)]:
+                  paginator = client.get_paginator('lookup_events')
+                  response_iterator = paginator.paginate(
+                      LookupAttributes=[{'AttributeKey': attribute_key, 'AttributeValue': attribute_value}],
+                      StartTime=start_lookup_time,
+                      EndTime=end_lookup_time
+                  )
+                  for value in response_iterator:
+                      if value["Events"]:
+                          handle_event(value, resourceName, resourceId, resourceType, resourceARN, end_lookup_time, configurationItemStatus,CI)
+                          return
+          def handle_event(value, resourceName, resourceId, resourceType, resourceARN, end_lookup_time, configurationItemStatus, CI):
+              lambda_runtime_region = os.environ['AWS_REGION']
+              config_console_link = f'https://{lambda_runtime_region}.console.aws.amazon.com/config/home?region={lambda_runtime_region}#/resources/timeline?resourceId={urllib.parse.quote_plus(resourceId)}&resourceType={urllib.parse.quote_plus(resourceType)}'
+              for event in value["Events"]:
+                  CloudTrailEvent = json.loads(event["CloudTrailEvent"])
+                  if event["ReadOnly"] == "true" or "errorCode" in CloudTrailEvent or "errorMessage" in CloudTrailEvent or not event["Resources"]:
+                      continue
+                  for resourcevalues in event["Resources"]:
+                      if resourcevalues["ResourceType"] == resourceType and resourcevalues["ResourceName"] in [resourceName, resourceId]:
+                          userIdentity = CloudTrailEvent["userIdentity"]["arn"] if CloudTrailEvent["userIdentity"]["type"] in ["Root","IAMUser","AssumedRole"] else f"\n{json.dumps(CloudTrailEvent['userIdentity'], indent=2)}"
+                          add_to_dynamodb(CI, event,event["EventName"],resourceType,resourceARN,resourceName)
+                          return
+          def add_to_dynamodb(CI, CT,eventName,resourceType, resourceARN,resourceName):
+              try:
+                  global all_tags
+                  table_name = os.environ['DynamoDBTableName']
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(table_name)
+                  item = {
+                      'id': str(uuid.uuid4()),
+                      'timestamp': int(time.time()),
+                      'ttl': int(time.time()) + 2592000,  # 30 days TTL,
+                      'eventName':eventName,
+                      'resourceType':resourceType,
+                      'resourceARN':resourceARN,
+                      'resourceName':resourceName,
+                      'configurationChanged': str(CI),
+                      'cloudTrailEvent': str(CT),
+                  }
+                  print(item)
+                  result = find_matches(str(item), all_tags)
+                  if result is not None and len(result)>0:
+                      item["tags"]=str(list(set(all_tags)))
+                      print(table.put_item(Item=item))
+                      print(f"Message added to DynamoDB table: {table_name}")
+              except Exception as error:
+                  print(str(error))
+          def find_matches(paragraph, stringsToMatchArr):
+              results = []
+              for string_to_match in stringsToMatchArr:
+                  # Escape special regex characters in the string to match
+                  pattern = re.escape(string_to_match)
+                  # Find all matches of the current string in the paragraph
+                  matches = re.findall(pattern, paragraph, re.IGNORECASE)
+                  # Add all matches to the results list
+                  results.extend(matches)
+              return results
+          def extract_tags_from_string(tag_string):
+                  """Extract tags from a string that contains a dictionary-like structure."""
+                  pattern = os.environ['AuditKeyPattern']
+                  match = re.search(pattern, tag_string)
+                  if match:
+                      value = match.group(1)
+                      return value
+          def read_csv_and_extract_tags( file_key):
+                  """Read a CSV file and extract all tags from it."""
+                  try:
+                      # Get the object from S3
+                      response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+                      # Read CSV into pandas DataFrame
+                      df = pd.read_csv(io.BytesIO(response['Body'].read()))
+                      # Look for column that might contain tags
+                      tag_columns = [col for col in df.columns if 'tag' in col.lower()]
+                      all_tags_list = []
+                      # Process each potential tag column
+                      for col in tag_columns:
+                          for value in df[col].dropna():
+                              tags = extract_tags_from_string(value)
+                              all_tags_list.append(tags)
+                      return all_tags_list
+                  except Exception as e:
+                      print(f"Error processing file {file_key}: {str(e)}")
+                      return {}
+          def process_all_files_for_tags():
+                  """Process all CSV files and collect all unique tags."""
+                  all_tags_list = []
+                  # Get all CSV files
+                  csv_files = get_all_csv_files()
+                  print(csv_files)
+                  # Process each file
+                  for file_key in csv_files:
+                      print(f"Processing file: {file_key}")
+                      file_tags = read_csv_and_extract_tags(file_key)
+                      all_tags_list.extend(file_tags)
+                  return all_tags_list
+          def get_all_csv_files():
+                  """Get list of all CSV files in the S3 bucket."""
+                  try:
+                      csv_files = []
+                      paginator = s3_client.get_paginator('list_objects_v2')
+                      # Iterate through all objects in the bucket
+                      for page in paginator.paginate(Bucket=bucket_name):
+                          if 'Contents' in page:
+                              for obj in page['Contents']:
+                                  # Check if file is a CSV
+                                  if obj['Key'].lower().endswith('.csv'):
+                                      csv_files.append(obj['Key'])
+                      return csv_files
+                  except Exception as e:
+                      print(f"Error listing CSV files: {str(e)}")
+                      return []
+
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt LookupCIEventsLambdaFunctionExecutionRole.Arn
+      Timeout: 30
+      Layers:
+        - !Ref LambdaLayerArn
+      ReservedConcurrentExecutions: !If
+        - HasLambdaReservedConcurrentExecutions
+        - !Ref LambdaReservedConcurrentExecutions
+        - !Ref AWS::NoValue
+
+  LookupCIEventsLambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/LookupCIEventsLambdaFunction
+      RetentionInDays: 7
+
+  LookupCIEventsLambdaFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/LookupCIEventsLambdaFunction:*
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt LookupCIEventsDynamoDBTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt LookupCIEventsSQSQueue.Arn
+                  - !GetAtt LookupCIEventsSQSQueueDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${EstimatesBucket}
+                  - !Sub arn:${AWS::Partition}:s3:::${EstimatesBucket}/*
+
+  AuditFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AuditFunction
+      Handler: index.lambda_handler
+      Role: !GetAtt AuditFunctionExecutionRole.Arn
+      Code:
+        ZipFile: |
+            import boto3
+            import time
+            import json
+            import os
+            import pandas as pd
+            import io,re
+            from datetime import datetime, timedelta
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.application import MIMEApplication
+            from email.mime.base import MIMEBase
+            from email import encoders
+            from botocore.config import Config
+            config = Config(read_timeout=300)
+            region_name=os.environ['Region']
+            bedrock = boto3.client(
+                        service_name='bedrock-runtime',
+                        region_name=region_name,
+                        config=config
+                    )
+            s3_client = boto3.client(
+                        's3',
+                        region_name=region_name
+                    )
+            bucket_name=os.environ['EstimatesBucket']
+            model_id=os.environ['ModelId']
+            dynamodb = boto3.resource('dynamodb')
+            def lambda_handler(event, context):
+                all_tags = process_all_files_for_tags()
+                estimates=process_all_csv_files()
+
+
+                (today_analysis,today_config_emailbody,configItems)= get_config_changes_emailbody(24,0,None,estimates)
+
+                cur_start_time = (datetime.now() - timedelta(hours=48)).strftime('%Y-%m-%d')
+
+                cur_end_time = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d')
+                
+                cur=get_cost_and_usage(all_tags,cur_start_time,cur_end_time)
+
+                (daybefore_analysis,daybefore_config_emailbody,configItems)= get_config_changes_emailbody(72,48,cur,estimates)
+
+                yesterday_response_text=get_bedrock_response(cost_prompt,configItems,cur,estimates,daybefore_analysis,cur_start_time,cur_end_time)
+                    
+                yesterday_cost_email_body=find_html_content(yesterday_response_text)
+
+                sendEmail(cur_start_time,cur_end_time,today_config_emailbody,today_analysis,daybefore_config_emailbody,yesterday_cost_email_body,daybefore_analysis)
+                    
+
+            def sendEmail(cur_start_time,cur_end_time,today_config_emailbody,today_analysis,daybefore_config_emailbody,yesterday_cost_email_body,thinking_content):
+
+                email_body=f'''<html>  {today_config_emailbody} 
+                {daybefore_config_emailbody} 
+                {yesterday_cost_email_body} </html>'''
+
+                source_email = os.environ['SourceEmail']
+                destination_to_email = os.environ['DestinationEmail']
+                # Read email addresses and send SES templated email
+                msg = MIMEMultipart('mixed')
+                # The subject line for the email.
+                SUBJECT = f'[{cur_start_time}-{cur_end_time}]Daily Configuration Audit Report and Cost Analysis '
+
+                # The HTML body of the email.
+                BODY_HTML = email_body
+                #(html_data)
+                # Create the attachment (text file)
+                if today_analysis:
+                    analysis_attachment = MIMEBase('text', 'plain')
+                    analysis_attachment.set_payload(today_analysis.encode())
+                    encoders.encode_base64(analysis_attachment)
+                    analysis_attachment.add_header('Content-Disposition', 'attachment', filename='recent_analysis.txt')
+                    # Attach the attachment to the container email message
+                    msg.attach(analysis_attachment)
+
+                # Create the attachment (text file)
+                if thinking_content:
+                    analysis_attachment = MIMEBase('text', 'plain')
+                    analysis_attachment.set_payload(thinking_content.encode())
+                    encoders.encode_base64(analysis_attachment)
+                    analysis_attachment.add_header('Content-Disposition', 'attachment', filename='analysis.txt')
+                    # Attach the attachment to the container email message
+                    msg.attach(analysis_attachment)
+                # The character encoding for the email.
+                CHARSET = 'utf-8'
+                # Add subject, from and to lines.
+                msg['Subject'] = SUBJECT
+                msg['From'] = source_email
+                msg['To'] = destination_to_email
+                # Create a multipart/alternative child container.
+                msg_body = MIMEMultipart('alternative')
+                # Encode the text and HTML content and set the character encoding. This step is
+                # necessary if you're sending a message with characters outside the ASCII range.
+                textpart = MIMEText(email_body.encode(CHARSET), 'plain', CHARSET)
+                htmlpart = MIMEText(email_body.encode(CHARSET), 'html', CHARSET)
+                # Add the text and HTML parts to the child container.
+                msg_body.attach(textpart)
+                msg_body.attach(htmlpart)
+                # Attach the multipart/alternative child container to the multipart/mixed parent container.
+                msg.attach(msg_body)
+                #Provide the contents of the email.
+                ses = boto3.client('ses')
+
+                sesresponse = ses.send_raw_email(
+                    Source=source_email,
+                    Destinations=[
+                            destination_to_email
+                                ],
+                                RawMessage={
+                                    'Data':msg.as_string(),
+                                }
+                            )
+                print(f"Audit report sent successfully { sesresponse}")    
+                
+
+            def get_config_changes_emailbody(hour_from,hour_to,cur,estimates):
+                _from=datetime.now() - timedelta(hours=hour_from)
+                _to=datetime.now() - timedelta(hours=hour_to)
+                start_time = int(_from.timestamp())
+                end_time = int(_to.timestamp())
+                
+                items=get_configuration_changed(start_time,end_time)
+                if items:
+                    response_text=get_bedrock_response(primary_prompt,items,cur,estimates,None)
+
+                    thinking_content =find_thinking_content(response_text)
+
+                    response_text=get_bedrock_response(configuration_prompt,items,cur,estimates,thinking_content,(_from).strftime('%Y-%m-%d %H:%M'),(_to).strftime('%Y-%m-%d %H:%M'))
+
+                    config_email_body =find_html_content(response_text)
+
+                    return (thinking_content,config_email_body,items)
+
+                return (None,None,None)   
+
+
+            def get_bedrock_response(prompt,items,cur,estimates,primary_analysis,from_date=None,to_date=None):
+                    doc_message = {
+                        "role": "user",
+                        "content": [
+                            {"text": prompt.format(from_date,to_date)}                
+                        ]
+                    }
+
+                    if (primary_analysis):
+                        doc_message["content"].append({"text": f'<Primary Analysis>{primary_analysis}</Primary Analysis>' })
+                
+                    if (items):
+                        doc_message["content"].append({"text": f'<ConfigurationChanges>{items}</ConfigurationChanges>' })
+                    
+                    if (cur):
+                        doc_message["content"].append({"text": f'<DailyCostAndUsageReport>{items}</DailyCostAndUsageReport>' })
+                    
+
+                    print(estimates)
+                    if estimates:
+                        for estimate in estimates:
+                            doc_message["content"].append({
+                                    "document": {
+                                        "name": "Approved Estimates",
+                                        "format": "csv",
+                                        "source": {
+                                            "bytes": estimate
+                                        }
+                                    }
+                                })
+
+                    response=bedrock.converse(
+                        modelId=model_id,
+                        messages=[doc_message],
+                        inferenceConfig={
+                            "maxTokens": 4096,
+                            "temperature": 0.1
+                        },
+                    )
+                    response_text = response['output']['message']['content'][0]['text']
+                    print('response_text')
+                    
+                    return response_text
+
+                    
+                    
+
+            def find_html_content(text):
+                pattern = r'<html>(.*?)</html>'
+                match = re.search(pattern, text, re.DOTALL)
+                if match:
+                    return match.group(1)
+                else:
+                    return None
+            def find_thinking_content(text):
+                pattern = r'<Thinking>(.*?)</Thinking>'
+                match = re.search(pattern, text, re.DOTALL)
+                if match:
+                    return match.group(1)
+                else:
+                    return None
+            def get_configuration_changed(start_time, end_time):
+                table = dynamodb.Table(os.environ['DynamoDBTableName'])
+                items = []
+                # Initialize pagination parameters
+                pagination_config = {
+                    'FilterExpression': '#ts >= :start_time AND #ts <= :end_time',
+                    'ExpressionAttributeNames': {'#ts': 'timestamp'},
+                    'ExpressionAttributeValues': {
+                        ':start_time': start_time,
+                        ':end_time': end_time
+                    }
+                }
+                # Loop through all pages
+                while True:
+                    response = table.scan(**pagination_config)
+                    items.extend(response['Items'])
+                    # Check if there are more pages to scan
+                    if 'LastEvaluatedKey' in response:
+                        pagination_config['ExclusiveStartKey'] = response['LastEvaluatedKey']
+                    else:
+                        break
+                return items
+            def get_cost_and_usage(all_tags,cur_start_time,cur_end_time):
+                client = boto3.client('ce',
+                                region_name='us-east-1',
+                                )
+                cur = client.get_cost_and_usage(
+                TimePeriod={
+                    'Start': cur_start_time,
+                    'End': cur_end_time
+                },
+                Filter={
+                    'Tags': {
+                        'Key': 'client_id',
+                        'Values': all_tags,
+                        'MatchOptions': ['EQUALS']
+                    }
+                },
+                Granularity='DAILY',
+                Metrics=[
+                    'NormalizedUsageAmount',
+                ]
+            )
+                return cur['ResultsByTime']
+            def get_all_csv_files():
+                    """Get list of all CSV files in the S3 bucket."""
+                    try:
+                        csv_files = []
+                        paginator = s3_client.get_paginator('list_objects_v2')
+                        # Iterate through all objects in the bucket
+                        for page in paginator.paginate(Bucket=bucket_name):
+                            if 'Contents' in page:
+                                for obj in page['Contents']:
+                                    # Check if file is a CSV
+                                    if obj['Key'].lower().endswith('.csv'):
+                                        csv_files.append(obj['Key'])
+                        return csv_files
+                    except Exception as e:
+                        print(f"Error listing CSV files: {str(e)}")
+                        return []
+            def read_file_content(file_key):
+                """Read content of a specific file from S3."""
+                try:
+                    # Get the object from S3
+                    response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+                    # Read the content
+                    content = response['Body'].read()#.decode('utf-8')
+                    print (content)
+                    return content
+                except botocore.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == 'NoSuchKey':
+                        print(f"Error: The file '{file_key}' was not found.")
+                    else:
+                        print(f"Error: There was an issue reading the file '{file_key}': {str(e)}")
+                except Exception as e:
+                    print(f"Error: There was an issue reading the file '{file_key}': {str(e)}")
+                return None
+            def process_all_csv_files():
+                    """Process all CSV files in the bucket."""
+                    try:
+                        # Get all CSV files
+                        csv_files = get_all_csv_files()
+                        # Dictionary to store file contents
+                        file_contents = []
+                        # Process each file
+                        for file_key in csv_files:
+                            content = read_file_content(file_key)
+                            if content is not None:
+                                file_contents.append( content)
+                        return file_contents
+                    except Exception as e:
+                        print(f"Error processing CSV files: {str(e)}")
+                        return {}
+            def extract_tags_from_string(tag_string):
+                """Extract tags from a string that contains a dictionary-like structure."""
+                pattern = os.environ['AuditKeyPattern']
+                match = re.search(pattern, tag_string)
+                if match:
+                    value = match.group(1)
+                    return value
+            def read_csv_and_extract_tags( file_key):
+                    """Read a CSV file and extract all tags from it."""
+                    try:
+                        # Get the object from S3
+                        response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+                        # Read CSV into pandas DataFrame
+                        df = pd.read_csv(io.BytesIO(response['Body'].read()))
+                        # Look for column that might contain tags
+                        tag_columns = [col for col in df.columns if 'tag' in col.lower()]
+                        all_tags = []
+                        # Process each potential tag column
+                        for col in tag_columns:
+                            for value in df[col].dropna():
+                                tags = extract_tags_from_string(value)
+                                all_tags.append(tags)
+                        return all_tags
+                    except Exception as e:
+                        print(f"Error processing file {file_key}: {str(e)}")
+                        return {}
+            def process_all_files_for_tags():
+                    """Process all CSV files and collect all unique tags."""
+                    all_tags = []
+                    # Get all CSV files
+                    csv_files = get_all_csv_files()
+                    print(csv_files)
+                    # Process each file
+                    for file_key in csv_files:
+                        print(f"Processing file: {file_key}")
+                        file_tags = read_csv_and_extract_tags(file_key)
+                        all_tags.extend(file_tags)
+                    return all_tags
+            disclaimerStr='''<h2> Disclaimer</h2>
+                            <p>Please note that the recommendations provided by this
+                    GenAI Audit Solution are generated on a
+                    best-effort basis by the AI model. While the solution aims to provide
+                    intelligent and accurate insights, it is crucial for the operations
+                    team to exercise caution and consult with subject matter experts or
+                    specialists before executing any recommendations or making critical
+                    decisions.</p>
+                            <p>The AI model's outputs should be carefully reviewed and
+                    validated by experienced professionals to ensure their applicability
+                    and alignment with your organization's specific requirements,
+                    policies, and best practices. The recommendations should be treated as
+                    guidance and used in conjunction with human expertise and domain
+                    knowledge.</p>
+                            <p>It is essential to understand that the AI model's
+                    recommendations may not always be perfect or account for all possible
+                    scenarios or edge cases. Therefore, it is strongly recommended to
+                    conduct thorough testing and validation before implementing any
+                    significant changes based on the AI-generated recommendations.</p>
+                            <p>The maintainers of this solution and the AI model provider
+                    cannot be held responsible for any direct or indirect consequences
+                    resulting from the implementation of the recommendations without
+                    proper due diligence and expert validation.   </p>'''
+            primary_prompt = '''You are the Virtual Cost and Configuration Auditor who is specialist in validating each configuration change and its cost impact
+                    IMPORTANT: you will compare each configuration change with every <Approved Estimates> and actual cost incur <DailyCostAndUsageReport> based on [Tag]
+                    <Instructions>
+                    - Take your time and think carefully before answering
+                    - <Approved Estimates> have monthly cost so you have to Extrapolate actual cost incur <DailyCostAndUsageReport> for Analysis
+                    - Run both <Primary Analysis Steps> and <Secondary Analysis Steps> before consolidating findings in <ResponseFormat>
+                    - Think step by step in <Thinking> tag before generating final response, <Thinking> tag must have all details required for Human audit of finally generated report
+                    - Do not generate false Alarm- only add Findings in <Response> tag where you are confident
+                    - Do not Dictate human, be humble and use suggestive tone
+                    </Instructions>
+                    <Primary Analysis Steps>
+                    1- Iterate through each configuration change in <ConfigurationChanges>
+                    2- For each Tag find Approved configuration and estimated Cost in all <Approved Estimates>
+                    3- For each Tag find Actual cost incur in <DailyCostAndUsageReport>
+                    4- Find Configuration Change which is not in Approved or may lead to Cost Impact
+                    5- Remove Redundant Finding per Tag, Keep only relevent configuration change with significant impact
+                    </Primary Analysis Steps>
+                    # Secondary analysis is irrespective of configuration change
+                    <Secondary Analysis Steps>
+                    1- Iterate through each Tag in all estimated <Approved Estimates>
+                    2- For each Tag find Actual cost incur in <DailyCostAndUsageReport>
+                    3- Find any Anomaly in estimated vs actual cost for each Tag
+                    </Secondary Analysis Steps>
+                    
+                    <ResponseFormat>
+                    <Thinking>
+                    </Thinking>
+                    </ResponseFormat>
+                    Skip Preamble
+                    '''
+
+            configuration_prompt = '''You are the Virtual Cost and Configuration Auditor who is specialist in validating each configuration change and its cost impact
+                    IMPORTANT: you will compare each configuration change with every <Approved Estimates> and actual cost incur <DailyCostAndUsageReport> based on [Tag]
+                    <Instructions>
+                    - Take your time and think carefully go through <Primary Analysis> before answering
+                    - <Approved Estimates> have monthly cost so you have to Extrapolate actual cost incur <DailyCostAndUsageReport> for Analysis
+                    - Run <Final Analysis Steps> to generate final response
+                    - Do not generate false Alarm- only add Findings in <ResponseFormat> tag where you are confident
+                    - Do not Dictate human, be humble and use suggestive tone
+                    </Instructions>
+
+                    <Final Analysis Steps>
+                    1- Iterate only through each Critical Finding in <Primary Analysis>
+                    2- Validate Tag wise each Critical finding with <ConfigurationChanges>
+                    2- Validate Tag wise each Critical finding with estimated Cost in all <Approved Estimates>
+                    3- Validate Tag wise each Critical finding with find Actual cost incur in <DailyCostAndUsageReport>
+                    4- Validate Tag wise each Critical Configuration Change which is not in Approved or may lead to Cost Impact
+                    5- Remove Redundant Finding per Tag, Keep only relevent configuration change with significant impact
+                    </Final Analysis Steps>
+                                    
+                    <ResponseFormat>
+                    1- Deduplicate all findings of <Final Analysis Steps> 
+                    2- Generate Crisp and short responses in <HTML Format> in <Response> tag
+                    3- For <Primary Analysis Steps> update table 'Configuration Audit Report' group based on Tag & add Timestamp, Configuration Change, Done By, Configuration Discrepency, Cost Impact Forecast
+                    4- Highlight important Configuration or cost with bold <b> for better visibility
+                    5- It is Mandatory to show date range as is in table heading <h3>
+                    6-    <HTML Format>
+                        ```html
+                            <html>
+                            <h2><span style='color: #d13212;'>&#9888;</span> Configuration and Cost Analysis Report ({0} - {1})</h2>
+                            <h3>Configuration Audit Report</h3>
+                            <table style='width: 100%; border-collapse: collapse; margin-bottom: 20px;' border='1' cellspacing='0' cellpadding='5'>
+                            <thead>
+                                <tr style='background-color: #f2f3f3;'>
+                                <th style='color: #16191f;'><strong>Tag</strong></th>
+                                <th style='color: #16191f;'><strong>Timestamp</strong></th>
+                                <th style='color: #16191f;'><strong>Configuration Change</strong></th>
+                                <th style='color: #16191f;'><strong>Done By</strong></th>
+                                <th style='color: #16191f;'><strong>Configuration Discrepancy</strong></th>
+                                <th style='color: #16191f;'><strong>Cost Impact Forecast</strong></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                <td>{{Tag}}</td>
+                                <td>{{Timestamp}}</td>
+                                <td>{{ConfigurationChange}}</td>
+                                <td>{{DoneBy}}</td>
+                                <td>{{ConfigurationDiscrepancy}}</td>
+                                <td>{{CostImpactForecast}}</td>
+                                </tr>
+                            </tbody>
+                            </table>
+                            </html>
+                            ```
+                        </HTML Format>
+                    </ResponseFormat>
+                    Skip Preamble
+                    '''
+
+            cost_prompt = '''You are the Virtual Cost Auditor who is specialist in validating estimated cost and Actual cost Per Tag
+                    IMPORTANT: you will compare each Tag with  <Approved Estimates> and actual cost incur <DailyCostAndUsageReport> based on [Tag]
+                    <Instructions>
+                    - Take your time and think carefully go through <Primary Analysis> before answering
+                    - <Approved Estimates> have monthly cost so you have to Extrapolate actual cost incur <DailyCostAndUsageReport> for Analysis
+                    - Run <Final Analysis Steps> to generate final response
+                    - Do not generate false Alarm- only add Findings in <ResponseFormat> tag where you are confident
+                    - Do not Dictate human, be humble and use suggestive tone
+                    </Instructions>
+                    
+                    # Final analysis is irrespective of configuration change
+                    <Final Analysis Steps>
+                    1- Iterate only through each Critical Finding per Tag in <Primary Analysis>
+                    1- Iterate Tag wise through each Critical Finding  in all estimated <Approved Estimates>
+                    2- For each Tag wise Critical Finding find Actual cost incur in <DailyCostAndUsageReport>
+                    3- Find any Anomaly in estimated vs actual cost for each Tag
+                    </Final Analysis Steps>
+                    <ResponseFormat>
+                    1- Deduplicate all findings of <Final Analysis Steps> when found in <Primary Analysis Steps>
+                    2- Generate Crisp and short responses in <HTML Format> in <Response> tag
+                    3- For <Final Analysis Steps> update table 'Cost Analysis Report' with Tag, Estimated Cost, Actual Cost, Remarks
+                    4- Highlight important Configuration or cost with bold <b> for better visibility
+                    5- It is Mandatory to show date range as is in table heading <h3>
+                    6-    <HTML Format>
+                        ```html
+                            <html>
+                            
+                            <h3>Cost Analysis Report ({0} - {1})</h3>
+                            <table style='width: 100%; border-collapse: collapse;' border='1' cellspacing='0' cellpadding='5'>
+                            <thead>
+                                <tr style='background-color: #f2f3f3;'>
+                                <th style='color: #16191f;'><strong>Tag</strong></th>
+                                <th style='color: #16191f;'><strong>Estimated Cost</strong></th>
+                                <th style='color: #16191f;'><strong>Actual Cost</strong></th>
+                                <th style='color: #16191f;'><strong>Remarks</strong></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                <td>{{Tag}}</td>
+                                <td>{{EstimatedCost}}</td>
+                                <td>{{ActualCost}}</td>
+                                <td>{{Remarks}}</td>
+                                </tr>
+                            </tbody>
+                            </table>
+                            </body>
+                            </html>
+                            ```
+                        </HTML Format>
+                    </ResponseFormat>
+                    Skip Preamble
+                    '''
+
+      Runtime: python3.8
+      Timeout: 300
+      Layers:
+        - !Ref LambdaLayerArn
+      Environment:
+        Variables:
+          DynamoDBTableName: !Ref LookupCIEventsDynamoDBTable
+          EstimatesBucket: !Ref EstimatesBucket
+          ModelId: !Ref ModelId
+          Region: !Ref Region
+          SourceEmail: !Ref SourceEmail
+          DestinationEmail: !Ref DestinationEmail
+          AuditKeyPattern: !Ref AuditKeyPattern
+
+  AuditFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AuditFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource: !GetAtt LookupCIEventsDynamoDBTable.Arn
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/AuditFunction:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${EstimatesBucket}
+                  - !Sub arn:${AWS::Partition}:s3:::${EstimatesBucket}/*
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  AuditFunctionScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger Audit Function every 24 hours
+      ScheduleExpression: rate(24 hours)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AuditFunction.Arn
+          Id: AuditFunctionTarget
+
+  AuditFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuditFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AuditFunctionScheduledRule.Arn
+
+  LookupCIEventsLambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: LookupCIEventsLambdaFunction
+    Properties:
+      Enabled: true
+      EventSourceArn: !GetAtt LookupCIEventsSQSQueue.Arn
+      FunctionName: !Ref LookupCIEventsLambdaFunction
+
+  LookupCIEventsLambdaFunctionEventSourceMappingDLQ:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: LookupCIEventsLambdaFunction
+    Properties:
+      Enabled: true
+      EventSourceArn: !GetAtt LookupCIEventsSQSQueueDLQ.Arn
+      FunctionName: !Ref LookupCIEventsLambdaFunction
+
+  LookupCIEventsCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudWatch Event Rule that captures Configuration Change Items and
+        send to SQS.
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Configuration Item Change
+        detail:
+          configurationItem:
+            resourceType: !If
+              - NotResourceTypesToBeCapturedByCWERule
+              - - anything-but:
+                    - AWS::Config::ResourceCompliance
+                    - AWS::SSM::AssociationCompliance
+                    - AWS::Config::ConformancePackCompliance
+              - !Ref ResourceTypesToBeCapturedByCWERule
+            configurationItemStatus: !FindInMap
+              - Settings
+              - CIStatus
+              - !Ref CIStatusToBeCapturedByCWERule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LookupCIEventsSQSQueue.Arn
+          Id: LookupCIEventsSQSQueue
+
+  LookupCIEventsCloudWatchEventRuleOversized:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudWatch Event Rule that captures Oversized Configuration Change
+        Items and send to SQS.
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Configuration Item Change
+        detail:
+          configurationItemSummary:
+            resourceType: !If
+              - NotResourceTypesToBeCapturedByCWERule
+              - - anything-but:
+                    - AWS::Config::ResourceCompliance
+                    - AWS::SSM::AssociationCompliance
+                    - AWS::Config::ConformancePackCompliance
+              - !Ref ResourceTypesToBeCapturedByCWERule
+            configurationItemStatus: !FindInMap
+              - Settings
+              - CIStatus
+              - !Ref CIStatusToBeCapturedByCWERule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LookupCIEventsSQSQueue.Arn
+          Id: LookupCIEventsSQSQueue
+
+  LookupCIEventsSQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt LookupCIEventsSQSQueueDLQ.Arn
+        maxReceiveCount: 5
+
+  LookupCIEventsSQSQueueDLQ:
+    Type: AWS::SQS::Queue
+
+  LookupCIEventsSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref LookupCIEventsSQSQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt LookupCIEventsSQSQueue.Arn
+
+Outputs:
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref LookupCIEventsDynamoDBTable
+  AuditFunctionName:
+    Description: Name of the Audit Lambda function
+    Value: !Ref AuditFunction
+  LookupCIEventsLambdaFunctionName:
+    Description: Name of the Lookup CI Events Lambda function
+    Value: !Ref LookupCIEventsLambdaFunction
+  LookupCIEventsSQSQueueURL:
+    Description: URL of the SQS Queue
+    Value: !Ref LookupCIEventsSQSQueue
+  LookupCIEventsSQSQueueDLQURL:
+    Description: URL of the SQS Dead Letter Queue
+    Value: !Ref LookupCIEventsSQSQueueDLQ
+  EstimatesS3BucketName:
+    Description: Name of the S3 bucket for AWS pricing estimates
+    Value: !Ref EstimatesS3Bucket
