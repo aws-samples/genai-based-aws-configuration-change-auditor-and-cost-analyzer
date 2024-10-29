@@ -162,7 +162,7 @@ The email includes:
 The solution can be customized in several ways:
 
 1. Adjust the Bedrock prompts in the Auditor Lambda function to focus on specific types of insights.
-2. Modify the report templates in Amazon SES to change the format or content of the emails.
+2. Modify the CustomInstructions parameter in CloudFormation Template for customized analysis.
 
 ## FAQ
 
